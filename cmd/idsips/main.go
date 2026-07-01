@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -25,6 +26,12 @@ import (
 )
 
 func main() {
+	rulesPath := flag.String("rules", "", "path to signed rule file (JSON); if unset, built-in default rules are used")
+	rulesSigPath := flag.String("rules-sig", "", "path to detached signature for -rules (default: <rules>.sig)")
+	rulesPubKey := flag.String("rules-pubkey", "", "path to hex-encoded ed25519 public key used to verify -rules")
+	rulesReloadInterval := flag.Duration("rules-reload-interval", 30*time.Second, "how often to check the signed rule file for changes")
+	flag.Parse()
+
 	logger := telemetry.New(slog.Default())
 
 	// Graceful shutdown on SIGINT/SIGTERM. A network security tool that
@@ -33,8 +40,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	sigEngine := signature.New(defaultRules())
+	if *rulesPath != "" {
+		setupSignedRules(ctx, sigEngine, *rulesPath, *rulesSigPath, *rulesPubKey, *rulesReloadInterval)
+	}
+
 	engines := []detect.Engine{
-		signature.New(defaultRules()),
+		sigEngine,
 		behavioral.New(10_000, 10*time.Second, 50.0),
 		tlsfp.New(map[string]string{}),
 	}
@@ -109,6 +121,49 @@ func process(
 		return
 	}
 	logger.LogDecision(d)
+}
+
+// setupSignedRules performs the mandatory, fail-loud initial load of a
+// signed rule file and then starts a background watcher for hot-reload.
+// Startup exits non-zero on a bad key, missing file, or failed signature —
+// an operator who pointed idsips at a broken or tampered rule file must
+// find out immediately, not have the process silently fall back to
+// whatever default rules happened to be compiled in.
+func setupSignedRules(ctx context.Context, sigEngine *signature.Engine, rulesPath, rulesSigPath, pubKeyPath string, interval time.Duration) {
+	if pubKeyPath == "" {
+		slog.Error("-rules given but -rules-pubkey is missing; refusing to load unverifiable rules")
+		os.Exit(1)
+	}
+	pubHex, err := os.ReadFile(pubKeyPath)
+	if err != nil {
+		slog.Error("failed to read -rules-pubkey", "path", pubKeyPath, "error", err)
+		os.Exit(1)
+	}
+	pk, err := signature.ParsePublicKeyHex(trimSpace(string(pubHex)))
+	if err != nil {
+		slog.Error("invalid -rules-pubkey", "error", err)
+		os.Exit(1)
+	}
+	if rulesSigPath == "" {
+		rulesSigPath = rulesPath + ".sig"
+	}
+
+	watcher := signature.NewWatcher(sigEngine, rulesPath, rulesSigPath, pk, interval, slog.Default())
+	if err := watcher.LoadInitial(); err != nil {
+		slog.Error("failed to load signed rule file at startup", "error", err)
+		os.Exit(1)
+	}
+	go watcher.Run(ctx)
+}
+
+func trimSpace(s string) string {
+	for len(s) > 0 && (s[len(s)-1] == '\n' || s[len(s)-1] == '\r' || s[len(s)-1] == ' ') {
+		s = s[:len(s)-1]
+	}
+	for len(s) > 0 && (s[0] == '\n' || s[0] == '\r' || s[0] == ' ') {
+		s = s[1:]
+	}
+	return s
 }
 
 func defaultRules() []signature.Rule {
