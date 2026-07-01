@@ -70,6 +70,37 @@ decision engine         (threshold -> verdict)
   flow-table exhaustion and queue exhaustion are the two classic DoS
   vectors against a stateful NIDS.
 
+### Signed rule hot-reload
+
+Rule files are JSON (`version: 1`, `rules: [...]`, patterns as hex strings)
+and must be detached-signed with ed25519 (`crypto/ed25519`, stdlib only —
+no new dependency) before `idsips` will load them:
+
+```sh
+go run ./cmd/signrules keygen -out-priv priv.hex -out-pub pub.hex   # once, offline
+go run ./cmd/signrules sign   -rules rules.json -priv priv.hex       # per update
+go run ./cmd/idsips -rules rules.json -rules-pubkey pub.hex          # verifies, then runs
+```
+
+`cmd/signrules` is a separate binary on purpose: the running IDS/IPS
+process only ever holds the *public* key. Startup fails loudly
+(non-zero exit, no fallback) if `-rules` is given without a valid
+signature — see `setupSignedRules` in `cmd/idsips/main.go`. Once
+running, `signature.Watcher` polls the file (`-rules-reload-interval`,
+default 30s) and hot-swaps rules via `atomic.Pointer` with zero lock
+contention on the packet path (`internal/detect/signature/engine.go`).
+A failed verification during a later poll is logged and the previous,
+already-verified rule set is kept — the engine never partially applies
+or falls back to zero rules.
+
+This was verified end-to-end, not just unit-tested: a tampered rule file
+was rejected at both process startup and during a live hot-reload attempt
+(the running process kept serving its last-known-good rules and logged the
+rejection on every poll, indefinitely); a file signed with a different
+keypair was rejected against the real public key; and the signing tool
+itself refuses to sign structurally invalid rule content before it ever
+reaches a running deployment.
+
 ### Still on the roadmap (not yet built)
 
 - Real capture backend: `github.com/cilium/ebpf` (XDP capture + in-kernel
@@ -79,8 +110,6 @@ decision engine         (threshold -> verdict)
   full JA3/JA4, not just version+cipher-suites.
 - Kubernetes pod/namespace identity attached to `types.FlowKey` for
   east-west visibility.
-- Signed rule files so hot-reloading signature rules can't become a
-  rule-injection vector.
 - Distributed correlation across multiple capture nodes.
 
 ## Security design principles applied in this code
@@ -88,10 +117,12 @@ decision engine         (threshold -> verdict)
 1. **Parsers fail closed, never guess.** `internal/parser` and
    `internal/detect/tlsfp` check every length against bytes actually
    available *before* slicing. Any inconsistency returns an error /
-   `ok=false` rather than truncating or assuming. `internal/parser`
-   ships a native Go fuzz test (`parser_fuzz_test.go`); a 30-second local
-   run executed over 1.2M inputs with zero panics — run it yourself with
-   `go test -fuzz=FuzzParse -fuzztime=60s ./internal/parser/`.
+   `ok=false` rather than truncating or assuming. Both hand-rolled binary
+   parsers ship native Go fuzz tests (`parser_fuzz_test.go`,
+   `engine_fuzz_test.go`); 30-second local runs executed over 1.2M and 1.0M
+   inputs respectively with zero panics — run them yourself with
+   `go test -fuzz=FuzzParse -fuzztime=60s ./internal/parser/` and
+   `go test -fuzz=FuzzFingerprint -fuzztime=60s ./internal/detect/tlsfp/`.
 2. **Bounded state, everywhere.** No map or channel in this codebase can
    grow without an explicit ceiling (`internal/detect/behavioral`,
    `internal/safety`). Overload degrades to dropped packets/evictions,
@@ -138,6 +169,6 @@ keep the supply-chain surface as small as possible for a security tool.
 - Add `gosec` and `staticcheck` to CI once the module has network access
   to fetch them (this sandbox's network policy didn't allow it; the code
   was checked with `go vet` and `gofmt` instead, both passing cleanly).
-- Add a fuzz target for `internal/detect/tlsfp`'s `fingerprint()`
-  specifically, since it is the second hand-rolled binary parser in the
-  codebase after `internal/parser`.
+- Real capture backend (see roadmap above) will need its own fuzz/replay
+  tests against known IDS-evasion techniques (fragmentation overlap, TCP
+  segmentation overlap) before it's trusted with live traffic.

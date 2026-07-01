@@ -1,0 +1,17 @@
+{
+    "version": 1,
+    "rules": [
+        {
+            "id": "demo-1",
+            "pattern_hex": "2f6574632f706173737764",
+            "severity": "high",
+            "reason": "path traversal indicator (/etc/passwd)"
+        },
+        {
+            "id": "demo-2",
+            "pattern_hex": "3c7363726970743e",
+            "severity": "medium",
+            "reason": "possible XSS payload (<script>)"
+        }
+    ]
+}
