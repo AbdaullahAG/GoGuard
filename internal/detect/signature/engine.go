@@ -2,6 +2,7 @@ package signature
 
 import (
 	"bytes"
+	"sync/atomic"
 
 	"ids-ips/internal/detect"
 	"ids-ips/pkg/types"
@@ -22,23 +23,49 @@ type Rule struct {
 	Reason   string
 }
 
-// Engine matches packet payloads against a fixed rule set.
+// Engine matches packet payloads against a rule set that can be swapped
+// atomically at runtime — see SetRules. Reads use atomic.Pointer rather
+// than a mutex specifically so Inspect, which runs on the hot packet path,
+// never blocks on a reload happening concurrently in another goroutine.
 type Engine struct {
-	rules []Rule
+	rules atomic.Pointer[[]Rule]
 }
 
 // New takes a defensive copy of rules so the caller mutating its original
 // slice after construction can't change engine behaviour underneath it.
 func New(rules []Rule) *Engine {
+	e := &Engine{}
+	e.SetRules(rules)
+	return e
+}
+
+// SetRules atomically replaces the active rule set. Safe to call
+// concurrently with Inspect from any number of goroutines — a reload is
+// always all-or-nothing from Inspect's point of view, it never observes a
+// half-updated rule list.
+func (e *Engine) SetRules(rules []Rule) {
 	cp := make([]Rule, len(rules))
 	copy(cp, rules)
-	return &Engine{rules: cp}
+	e.rules.Store(&cp)
+}
+
+// RuleCount reports how many rules are currently active, mainly for
+// health/metrics endpoints.
+func (e *Engine) RuleCount() int {
+	if p := e.rules.Load(); p != nil {
+		return len(*p)
+	}
+	return 0
 }
 
 func (e *Engine) Name() string { return "signature" }
 
 func (e *Engine) Inspect(pkt types.Packet) (types.Finding, bool) {
-	for _, r := range e.rules {
+	p := e.rules.Load()
+	if p == nil {
+		return types.Finding{}, false
+	}
+	for _, r := range *p {
 		if len(r.Pattern) == 0 {
 			continue // an empty pattern would otherwise "match" every packet
 		}
