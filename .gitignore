@@ -1,8 +1,0 @@
-# Binaries and memory dumps
-bin/
-*.exe
-*.test
-*.prof
-*.hex
-# OS generated files
-.DS_Store

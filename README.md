@@ -11,7 +11,7 @@ correlation) slots into an existing interface instead of requiring a
 rewrite — and so that the parts most exposed to attacker-controlled bytes
 are provably hardened today, not "to be hardened later".
 
-## Why this design 
+## Why this design
 
 Existing open-source tools were analyzed before writing any code:
 
@@ -101,11 +101,75 @@ keypair was rejected against the real public key; and the signing tool
 itself refuses to sign structurally invalid rule content before it ever
 reaches a running deployment.
 
+### Real XDP capture and in-kernel blocking
+
+`internal/capture/xdp` is a real, kernel-verified implementation of
+`capture.Source`, not a stub. The eBPF program
+(`internal/capture/xdp/bpf/xdp_capture.c`) runs at the XDP hook — before
+the kernel even allocates an `sk_buff` — and does two things: looks up the
+source IPv4 address in an in-kernel hash map and `XDP_DROP`s it
+immediately if blocked (the concrete "block (in-kernel)" box from the
+architecture diagram), and otherwise copies a bounded snapshot of the
+frame into a ring buffer for the existing Go pipeline to parse and
+inspect exactly as it already does for `capture.MockSource`.
+
+```sh
+go build -o idsips ./cmd/idsips
+sudo setcap cap_bpf,cap_net_admin+ep ./idsips   # or run as root
+./idsips -iface eth0 -rules rules.json -rules-pubkey pub.hex
+```
+
+This is Linux-only, gated behind `//go:build linux` (see
+`cmd/idsips/capture_linux.go` / `capture_other.go`). `go build` on Windows
+or macOS — this project's normal development platform — never attempts to
+compile `cilium/ebpf` at all; passing `-iface` there fails with a clear
+error message instead of a build break. `capture.MockSource` remains the
+default when `-iface` is omitted, so running `idsips` with no flags never
+requires root or Linux.
+
+**This was verified against a real kernel, not just written and assumed
+correct** — and that process surfaced two genuine bugs, fixed in the
+current code:
+
+1. The BPF verifier rejected the first version outright
+   (`R4 min value is negative`) because a packet-length value derived
+   through an intermediate signed-`long` cast can't be statically proven
+   bounded when passed as a helper's length argument. Fixed by computing
+   the copy through a fully-unrolled, compile-time-bounded loop that
+   checks `data_end` before every single byte read instead.
+2. Even after the verifier accepted it, the very first working version
+   silently dropped almost every real packet: it asked
+   `bpf_xdp_load_bytes` for a fixed 256-byte read regardless of actual
+   frame size, and that helper fails outright — no partial read — the
+   moment the requested length exceeds what's actually there, which is
+   true for most ordinary small packets. Real generated UDP traffic on
+   loopback (0 events captured) is what exposed this; it would not have
+   been caught by reading the code alone. The bounded unrolled-copy fix
+   above resolved this too, since it naturally copies `min(frame_len,
+   SNAPLEN)` bytes.
+3. A bare `link.AttachXDP` call with no flags reported success on
+   loopback without the hook ever firing (no native XDP driver exists for
+   `lo`, but the attach call didn't surface that as an error). Fixed with
+   an explicit driver-mode-then-generic-mode fallback in `attachXDP()`
+   in `source.go` — confirmed by testing that explicit driver mode
+   correctly *does* fail with `operation not supported` on loopback,
+   which is exactly the signal the fallback needs.
+
+With those three fixes, a full real chain was confirmed end-to-end on
+this development machine: real UDP traffic over loopback → real XDP
+capture → real ring buffer → `internal/parser` → `internal/detect/signature`
+correctly flagged a payload containing `/etc/passwd` and correctly passed
+a benign payload through — and the compiled `idsips -iface lo` binary
+produced the identical correct block/allow decisions in its own logs.
+
 ### Still on the roadmap (not yet built)
 
-- Real capture backend: `github.com/cilium/ebpf` (XDP capture + in-kernel
-  block) or `golang.org/x/sys/unix` AF_PACKET as a portable fallback —
-  both pure Go, no cgo.
+- IPv6 support in the XDP program (currently IPv4-only, matching the rest
+  of the pipeline).
+- A real `response.Blocker` that calls `xdp.Source.BlockIPv4` from a
+  `types.VerdictBlock` decision — the capability exists and was tested
+  directly, but `cmd/idsips` still wires only `DryRunBlocker` by default
+  in this version, consistent with "dry-run until validated" above.
 - TLS ClientHello extension parsing (ALPN, SNI, supported groups) for a
   full JA3/JA4, not just version+cipher-suites.
 - Kubernetes pod/namespace identity attached to `types.FlowKey` for
@@ -114,15 +178,17 @@ reaches a running deployment.
 
 ## Security design principles applied in this code
 
-1. **Parsers fail closed, never guess.** `internal/parser` and
-   `internal/detect/tlsfp` check every length against bytes actually
-   available *before* slicing. Any inconsistency returns an error /
-   `ok=false` rather than truncating or assuming. Both hand-rolled binary
-   parsers ship native Go fuzz tests (`parser_fuzz_test.go`,
-   `engine_fuzz_test.go`); 30-second local runs executed over 1.2M and 1.0M
-   inputs respectively with zero panics — run them yourself with
-   `go test -fuzz=FuzzParse -fuzztime=60s ./internal/parser/` and
-   `go test -fuzz=FuzzFingerprint -fuzztime=60s ./internal/detect/tlsfp/`.
+1. **Parsers fail closed, never guess.** `internal/parser`,
+   `internal/detect/tlsfp`, and `internal/capture/xdp` each check every
+   length against bytes actually available *before* slicing. Any
+   inconsistency returns an error / `ok=false` rather than truncating or
+   assuming. All three hand-rolled binary parsers ship native Go fuzz
+   tests (`parser_fuzz_test.go`, `engine_fuzz_test.go`,
+   `decode_fuzz_test.go`); 30-second local runs executed over 1.2M, 1.0M,
+   and 0.8M inputs respectively with zero panics — run them yourself with
+   `go test -fuzz=FuzzParse -fuzztime=60s ./internal/parser/`,
+   `go test -fuzz=FuzzFingerprint -fuzztime=60s ./internal/detect/tlsfp/`, and
+   `go test -fuzz=FuzzDecodeEvent -fuzztime=60s ./internal/capture/xdp/`.
 2. **Bounded state, everywhere.** No map or channel in this codebase can
    grow without an explicit ceiling (`internal/detect/behavioral`,
    `internal/safety`). Overload degrades to dropped packets/evictions,
@@ -132,9 +198,10 @@ reaches a running deployment.
    that backstop existing is not an excuse for sloppy engines; it exists
    because one buggy *third-party-contributed* detection engine should
    never be able to kill the whole pipeline.
-4. **No cgo.** Capture is defined as a pure-Go interface specifically so
-   the eventual production backend doesn't have to give up Go's memory
-   safety to talk to the kernel.
+4. **No cgo.** Capture is defined as a pure-Go interface; the real XDP
+   backend (`internal/capture/xdp`) uses `cilium/ebpf`, a pure-Go library
+   that talks to the kernel directly via syscalls — no cgo anywhere in
+   this codebase, still.
 5. **No regex on externally-updatable input.** The signature engine uses
    plain substring matching to avoid ReDoS from a future hostile or
    buggy rule file.
@@ -157,18 +224,51 @@ go test -fuzz=FuzzParse -fuzztime=60s ./internal/parser/   # adversarial-input f
 go run ./cmd/idsips                                   # runs against synthetic mock traffic
 ```
 
-There are no external dependencies — `go.mod` lists none on purpose, to
-keep the supply-chain surface as small as possible for a security tool.
+There are no external dependencies for the core detection/decision
+pipeline — `go.mod` lists none beyond `cilium/ebpf` (and its own
+transitive `golang.org/x/{sys,exp}`, pulled in only because `cilium/ebpf`
+itself needs them), which is the one real external dependency in this
+project, added specifically for the real XDP capture backend. Everything
+else — parsing, all three detection engines, correlation, decision,
+signed-rule verification — is standard library only.
+
+`internal/capture/xdp/bpf/xdp_capture.o` is a pre-compiled, stripped BPF
+object embedded via `go:embed`; regenerate it after editing
+`xdp_capture.c` with:
+
+```sh
+clang -O2 -target bpf -D__TARGET_ARCH_x86 \
+  -I/usr/include/bpf -I/usr/include/$(uname -m)-linux-gnu \
+  -c internal/capture/xdp/bpf/xdp_capture.c \
+  -o internal/capture/xdp/bpf/xdp_capture.o
+```
+
+## Continuous integration
+
+`.github/workflows/security.yml` runs on every push/PR: build, vet,
+gofmt check, race-detector tests, 60-second fuzz smoke tests for both
+hand-rolled parsers, `gosec`, `staticcheck`, and `govulncheck`, plus a
+nightly extended (10-minute) fuzz job. This was authored and syntax
+-validated (`yaml.safe_load`) but **not** run against a live GitHub
+Actions environment from here — `gosec`, `staticcheck`, and
+`govulncheck` all depend on hosts outside this sandbox's network
+allowlist (`proxy.golang.org`, `google.golang.org`, `honnef.co`), so they
+couldn't be installed and exercised locally the way the parser fuzzing,
+signing tool, and XDP program were. All three tools' GitHub Actions
+(`securego/gosec`, `dominikh/staticcheck-action`,
+`golang/govulncheck-action`) manage their own installation and will have
+normal internet access once this runs on actual GitHub infrastructure —
+but that first real run is the thing to watch, not an assumption to bank
+on.
 
 ## Suggested next hardening steps for contributors
 
-- Replace `capture.MockSource` with an `AF_PACKET`-based `Source` and add
-  an integration test that replays a pcap containing known evasion
-  techniques (IP fragmentation overlap, TCP segmentation overlap) and
-  asserts the parser/engines behave correctly against each.
-- Add `gosec` and `staticcheck` to CI once the module has network access
-  to fetch them (this sandbox's network policy didn't allow it; the code
-  was checked with `go vet` and `gofmt` instead, both passing cleanly).
-- Real capture backend (see roadmap above) will need its own fuzz/replay
-  tests against known IDS-evasion techniques (fragmentation overlap, TCP
-  segmentation overlap) before it's trusted with live traffic.
+- Watch the first real CI run closely — see the caveat above.
+- Wire a real `response.Blocker` on top of `xdp.Source.BlockIPv4` and
+  flip `cmd/idsips` to use it once dry-run alerting has been validated
+  against real traffic for a deployment.
+- Add IPv6 handling to `xdp_capture.c`, mirroring the IPv4 path.
+- Replace `capture.MockSource` with an `AF_PACKET`-based `Source` for
+  non-Linux or non-XDP-capable environments, and add an integration test
+  that replays a pcap containing known evasion techniques (IP
+  fragmentation overlap, TCP segmentation overlap).

@@ -30,6 +30,7 @@ func main() {
 	rulesSigPath := flag.String("rules-sig", "", "path to detached signature for -rules (default: <rules>.sig)")
 	rulesPubKey := flag.String("rules-pubkey", "", "path to hex-encoded ed25519 public key used to verify -rules")
 	rulesReloadInterval := flag.Duration("rules-reload-interval", 30*time.Second, "how often to check the signed rule file for changes")
+	iface := flag.String("iface", "", "network interface for real XDP capture (Linux only); if unset, synthetic mock traffic is used")
 	flag.Parse()
 
 	logger := telemetry.New(slog.Default())
@@ -61,12 +62,24 @@ func main() {
 	// NOTE for production: capability handling belongs here, before any
 	// packet is touched — acquire CAP_NET_RAW/CAP_BPF via
 	// golang.org/x/sys/unix, then drop every other capability and switch to
-	// a non-root UID. The mock source below needs no privileges at all,
-	// which is exactly why it is the default: privilege acquisition is
-	// opt-in and explicit, never automatic.
-	src := &capture.MockSource{
-		Frame:    sampleFrame(),
-		Interval: 200 * time.Millisecond,
+	// a non-root UID. The mock source remains the default specifically so
+	// that privilege acquisition stays opt-in and explicit: it only
+	// happens when an operator passes -iface, never automatically.
+	var src capture.Source
+	if *iface != "" {
+		realSrc, closer, err := newRealCaptureSource(*iface)
+		if err != nil {
+			slog.Error("failed to start real capture source", "iface", *iface, "error", err)
+			os.Exit(1)
+		}
+		defer closer.Close()
+		src = realSrc
+		slog.Info("using real XDP capture", "iface", *iface)
+	} else {
+		src = &capture.MockSource{
+			Frame:    sampleFrame(),
+			Interval: 200 * time.Millisecond,
+		}
 	}
 	frames, err := src.Frames(ctx)
 	if err != nil {
