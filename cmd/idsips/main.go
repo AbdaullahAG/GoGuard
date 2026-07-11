@@ -31,6 +31,9 @@ func main() {
 	rulesPubKey := flag.String("rules-pubkey", "", "path to hex-encoded ed25519 public key used to verify -rules")
 	rulesReloadInterval := flag.Duration("rules-reload-interval", 30*time.Second, "how often to check the signed rule file for changes")
 	iface := flag.String("iface", "", "network interface for real XDP capture (Linux only); if unset, synthetic mock traffic is used")
+	enforce := flag.Bool("enforce", false, "actually enforce Block verdicts via the real XDP blocklist (requires -iface); default is dry-run/log-only")
+	blockTTL := flag.Duration("block-ttl", 10*time.Minute, "how long an in-kernel block lasts before automatic expiry (only with -enforce)")
+	blockCapacity := flag.Int("block-capacity", 10_000, "max distinct blocked addresses tracked at once (only with -enforce)")
 	flag.Parse()
 
 	logger := telemetry.New(slog.Default())
@@ -57,7 +60,7 @@ func main() {
 		"tls-fingerprint": 0.8,
 	}, 0.5)
 	decider := decision.New(decision.Thresholds{Alert: 0.4, Block: 0.85})
-	blocker := &response.DryRunBlocker{Audit: logger}
+	var blocker response.Blocker = &response.DryRunBlocker{Audit: logger}
 
 	// NOTE for production: capability handling belongs here, before any
 	// packet is touched — acquire CAP_NET_RAW/CAP_BPF via
@@ -75,7 +78,30 @@ func main() {
 		defer closer.Close()
 		src = realSrc
 		slog.Info("using real XDP capture", "iface", *iface)
+
+		if *enforce {
+			// closer is the concrete *xdp.Source underneath; it satisfies
+			// response.IPv4Blocker (BlockIPv4/UnblockIPv4) as well as
+			// io.Closer. Asserting here rather than changing
+			// newRealCaptureSource's signature keeps capture_linux.go's
+			// contract minimal — response.EnforcingBlocker only needs to
+			// know about the two methods it actually calls.
+			ipBlocker, ok := closer.(response.IPv4Blocker)
+			if !ok {
+				slog.Error("-enforce requires a capture backend that supports in-kernel blocking")
+				os.Exit(1)
+			}
+			eb := response.NewEnforcingBlocker(ipBlocker, logger, *blockTTL, *blockCapacity, slog.Default())
+			go eb.Run(ctx, *blockTTL/10)
+			blocker = eb
+			slog.Warn("real enforcement ENABLED: Block verdicts will drop traffic in-kernel",
+				"block_ttl", *blockTTL, "block_capacity", *blockCapacity)
+		}
 	} else {
+		if *enforce {
+			slog.Error("-enforce requires -iface (real capture); refusing to start")
+			os.Exit(1)
+		}
 		src = &capture.MockSource{
 			Frame:    sampleFrame(),
 			Interval: 200 * time.Millisecond,
