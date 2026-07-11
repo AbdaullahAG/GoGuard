@@ -58,11 +58,13 @@ decision engine         (threshold -> verdict)
   `internal/telemetry`) — every Allow/Alert/Block decision is logged with
   its full evidence trail, not just blocks. "Why didn't it block this"
   needs an answer as much as "why did it block that".
-- **Dry-run-by-default enforcement** — `DryRunBlocker` is the only
-  `Blocker` wired in `cmd/idsips`. A live blocker (eBPF map update,
-  nftables) is a deliberate, explicit swap an operator makes after
-  validating false-positive rate against real traffic, never a default
-  a new deployment could accidentally inherit.
+- **Dry-run-by-default enforcement** — `DryRunBlocker` is what
+  `cmd/idsips` wires by default. A live blocker
+  (`response.EnforcingBlocker`, backed by the real in-kernel XDP
+  blocklist) is a deliberate, explicit opt-in via `-enforce`, made after
+  validating false-positive rate against real traffic — never a default
+  a new deployment could accidentally inherit. See "Real in-kernel
+  enforcement" below.
 - **Bounded resource usage everywhere there is attacker-influenced
   growth** — the behavioral engine's flow table (`internal/detect/behavioral`)
   and the processing queue (`internal/safety`) both have hard capacity
@@ -162,14 +164,46 @@ correctly flagged a payload containing `/etc/passwd` and correctly passed
 a benign payload through — and the compiled `idsips -iface lo` binary
 produced the identical correct block/allow decisions in its own logs.
 
+### Real in-kernel enforcement (EnforcingBlocker)
+
+`internal/response.EnforcingBlocker` turns a `types.VerdictBlock` decision
+into an actual kernel-level block via `xdp.Source.BlockIPv4`, wired in
+through `cmd/idsips`'s `-enforce` flag (requires `-iface`; refuses to
+start otherwise). It is not simply "call BlockIPv4 on every block
+decision" — that would introduce two problems of its own, both addressed
+directly:
+
+- **Bounded state.** Tracked blocks are capped (`-block-capacity`,
+  default 10,000) with LRU eviction, the same pattern as
+  `internal/detect/behavioral`'s flow table — an attacker able to trigger
+  blocks from many distinct (possibly spoofed) addresses cannot grow this
+  set without limit.
+- **Automatic expiry.** Every block carries a TTL (`-block-ttl`, default
+  10 minutes); a background sweep lifts it automatically. A permanent,
+  unreviewed block is itself an operational risk — a false positive
+  should not silently lock out a legitimate host forever. This mirrors
+  fail2ban's ban-time model, enforced here at line rate in-kernel instead
+  of via a log scraper.
+- **Never blocks loopback or 0.0.0.0.** A hard-coded guard, independent
+  of any rule or threshold, since blocking either would be actively
+  harmful (or is a parsing artifact, never a real attacker address).
+
+This was verified two ways: `internal/response/enforcing_test.go` covers
+the logic (refresh-instead-of-reblock, capacity eviction, TTL expiry,
+loopback guard) against a fake blocker with `go test -race`; separately,
+the real chain was exercised against the actual `xdp.Source` — a
+non-loopback address was blocked, confirmed present in the live kernel
+map, and confirmed auto-unblocked after its TTL elapsed, all on this
+development machine.
+
+```sh
+sudo ./idsips -iface eth0 -enforce -block-ttl 10m -rules rules.json -rules-pubkey pub.hex
+```
+
 ### Still on the roadmap (not yet built)
 
 - IPv6 support in the XDP program (currently IPv4-only, matching the rest
   of the pipeline).
-- A real `response.Blocker` that calls `xdp.Source.BlockIPv4` from a
-  `types.VerdictBlock` decision — the capability exists and was tested
-  directly, but `cmd/idsips` still wires only `DryRunBlocker` by default
-  in this version, consistent with "dry-run until validated" above.
 - TLS ClientHello extension parsing (ALPN, SNI, supported groups) for a
   full JA3/JA4, not just version+cipher-suites.
 - Kubernetes pod/namespace identity attached to `types.FlowKey` for
@@ -260,6 +294,42 @@ signing tool, and XDP program were. All three tools' GitHub Actions
 normal internet access once this runs on actual GitHub infrastructure —
 but that first real run is the thing to watch, not an assumption to bank
 on.
+
+## Test coverage
+
+Beyond the three fuzz targets (parser, tlsfp, xdp decoder), core logic has
+dedicated unit tests — `go test -race -cover ./...`:
+
+| package | coverage |
+|---|---|
+| `pkg/types` | 100.0% |
+| `internal/safety` | 100.0% |
+| `internal/telemetry` | 100.0% |
+| `internal/decision` | 100.0% |
+| `internal/capture` | 92.9% |
+| `internal/correlate` | 95.0% |
+| `internal/response` | 87.0% |
+| `internal/detect/signature` | 87.8% |
+| `internal/detect/behavioral` | 86.5% |
+| `internal/parser` | 82.0% (plus 1.2M fuzz executions, 0 panics) |
+| `internal/detect/tlsfp` | 73.2% (plus 1.0M fuzz executions, 0 panics) |
+| `internal/capture/xdp` | 11.8%* |
+
+\* `internal/capture/xdp` is low by this metric specifically because
+`New`, `Frames`, `attachXDP`, `BlockIPv4`, and `UnblockIPv4` all require a
+real Linux kernel, a real network interface, and elevated capabilities —
+properties a portable `go test` run can't assume. These were instead
+verified manually and directly against a real kernel during development
+(see "Real XDP capture" and "Real in-kernel enforcement" above); the
+parts that *can* run anywhere — `decodeEvent`, the third hand-rolled
+parser in this codebase — have both a fuzz target and dedicated
+table-driven unit tests, and are the reason this number isn't 0%.
+
+`cmd/idsips` and `cmd/signrules` show 0% by this metric because they're
+composition roots (flag parsing and wiring, not logic) — both were
+instead verified by actually running the compiled binaries end-to-end
+against real traffic, real signed rule files, and a real kernel, which a
+unit test can't substitute for anyway.
 
 ## Suggested next hardening steps for contributors
 
