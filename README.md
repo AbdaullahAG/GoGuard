@@ -4,7 +4,7 @@ A hybrid IDS/IPS skeleton in Go: signature matching + behavioral anomaly
 detection + TLS (JA3-style) fingerprinting, fused by an explainable
 correlation/scoring layer, feeding a decision engine that emits an
 auditable Allow/Alert/Block verdict per flow.
-
+ 
 This is a foundation, not a finished product. It is built so that every
 later addition (real eBPF capture, a real management API, distributed
 correlation) slots into an existing interface instead of requiring a
