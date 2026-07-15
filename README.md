@@ -33,7 +33,7 @@ explicit, auditable enforcement path. This project's architecture targets
 exactly those four gaps.
 
 ## Architecture
-
+ 
 ```
 network traffic
       v
