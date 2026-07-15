@@ -1,5 +1,5 @@
 # ids-ips
- 
+  
 A hybrid IDS/IPS skeleton in Go: signature matching + behavioral anomaly
 detection + TLS (JA3-style) fingerprinting, fused by an explainable
 correlation/scoring layer, feeding a decision engine that emits an
