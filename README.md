@@ -10,7 +10,7 @@ later addition (real eBPF capture, a real management API, distributed
 correlation) slots into an existing interface instead of requiring a
 rewrite — and so that the parts most exposed to attacker-controlled bytes
 are provably hardened today, not "to be hardened later".
- 
+  
 ## Why this design
 
 Existing open-source tools were analyzed before writing any code:
